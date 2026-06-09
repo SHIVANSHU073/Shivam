@@ -103,6 +103,9 @@ export const api = {
   teams: () => apiFetch('/teams'),
   teamCreate: (b: any) => apiFetch('/teams', { method: 'POST', body: b }),
   teamJoin: (b: any) => apiFetch('/teams/join', { method: 'POST', body: b }),
+  // VIP
+  vipStatus: () => apiFetch('/vip/status'),
+  vipSubscribe: () => apiFetch('/vip/subscribe', { method: 'POST', body: { plan: 'monthly' } }),
 };
 
 export { getToken };

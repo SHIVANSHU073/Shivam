@@ -241,6 +241,14 @@ class WithdrawalAction(BaseModel):
     note: Optional[str] = None
 
 
+class VipSubscribeReq(BaseModel):
+    plan: str = "monthly"  # monthly only for now
+
+
+    class Config:
+        extra = "ignore"
+
+
 class KycAction(BaseModel):
     user_id: str
     approve: bool
@@ -308,6 +316,8 @@ async def create_user(
         "referred_by": None,
         "bgmi_id": None,
         "ff_id": None,
+        "vip_active": False,
+        "vip_expires_at": None,
         "created_at": now_utc(),
         "device_fingerprints": [],
     }
@@ -317,18 +327,20 @@ async def create_user(
         if referrer:
             user["referred_by"] = referrer["user_id"]
             user["wallet"]["bonus"] = 50.0
+            # VIP referrers earn 2x
+            ref_bonus = 50.0 if is_vip(referrer) else 25.0
             await db.users.update_one(
                 {"user_id": referrer["user_id"]},
-                {"$inc": {"wallet.referral": 25.0}},
+                {"$inc": {"wallet.referral": ref_bonus}},
             )
             await db.transactions.insert_one({
                 "tx_id": new_id("tx"),
                 "user_id": referrer["user_id"],
                 "type": "referral_bonus",
-                "amount": 25.0,
+                "amount": ref_bonus,
                 "wallet": "referral",
                 "status": "success",
-                "note": f"Referral bonus from {name}",
+                "note": f"Referral bonus from {name}" + (" (2× VIP)" if ref_bonus == 50.0 else ""),
                 "created_at": now_utc(),
             })
     await db.users.insert_one(user)
@@ -620,8 +632,11 @@ async def register_tournament(req: RegisterReq, user=Depends(get_user)):
     if count >= t["max_slots"]:
         raise HTTPException(status_code=400, detail="Tournament full")
     # Deduct entry fee from wallets (bonus -> deposit -> winning)
-    fee = float(t.get("entry_fee", 0))
+    raw_fee = float(t.get("entry_fee", 0))
+    # VIP gets 10% off
     fresh = await db.users.find_one({"user_id": user["user_id"]}, {"_id": 0})
+    vip = is_vip(fresh)
+    fee = round(raw_fee * 0.9, 2) if vip else raw_fee
     w = fresh["wallet"]
     total = w["deposit"] + w["winning"] + w["bonus"]
     if fee > total:
@@ -1156,6 +1171,95 @@ async def admin_tickets(admin=Depends(require_admin)):
         u = await db.users.find_one({"user_id": d["user_id"]}, {"_id": 0, "name": 1, "email": 1})
         d["user"] = u
     return {"tickets": docs}
+
+
+# ============== VIP MEMBERSHIP ==============
+VIP_PRICE = 99.0
+VIP_DAYS = 30
+
+
+def is_vip(user: Dict[str, Any]) -> bool:
+    if not user.get("vip_active"):
+        return False
+    exp = user.get("vip_expires_at")
+    if not exp:
+        return False
+    if exp.tzinfo is None:
+        exp = exp.replace(tzinfo=timezone.utc)
+    return exp > now_utc()
+
+
+@api.post("/vip/subscribe")
+async def vip_subscribe(user=Depends(get_user), req: Optional[VipSubscribeReq] = None):
+    fresh = await db.users.find_one({"user_id": user["user_id"]}, {"_id": 0})
+    w = fresh["wallet"]
+    total = w["deposit"] + w["winning"] + w["bonus"]
+    if total < VIP_PRICE:
+        raise HTTPException(status_code=400, detail=f"Insufficient balance. Need ₹{VIP_PRICE}")
+    # Deduct from wallets (bonus -> deposit -> winning)
+    remaining = VIP_PRICE
+    deductions = {"bonus": 0.0, "deposit": 0.0, "winning": 0.0}
+    for key in ("bonus", "deposit", "winning"):
+        if remaining <= 0:
+            break
+        avail = w.get(key, 0)
+        take = min(avail, remaining)
+        deductions[key] = take
+        remaining -= take
+    inc = {f"wallet.{k}": -v for k, v in deductions.items() if v > 0}
+    # Extend if already active
+    base = fresh.get("vip_expires_at")
+    if base and base.tzinfo is None:
+        base = base.replace(tzinfo=timezone.utc)
+    start = base if base and base > now_utc() else now_utc()
+    new_exp = start + timedelta(days=VIP_DAYS)
+    upd = {"vip_active": True, "vip_expires_at": new_exp}
+    await db.users.update_one(
+        {"user_id": user["user_id"]},
+        {"$inc": inc, "$set": upd},
+    )
+    await db.transactions.insert_one({
+        "tx_id": new_id("tx"),
+        "user_id": user["user_id"],
+        "type": "vip_subscription",
+        "amount": -VIP_PRICE,
+        "wallet": "mixed",
+        "status": "success",
+        "note": "VIP Membership (30 days)",
+        "created_at": now_utc(),
+    })
+    await db.notifications.insert_one({
+        "notification_id": new_id("ntf"),
+        "user_id": user["user_id"],
+        "title": "Welcome to VIP! 🏆",
+        "message": "You now get 10% off entry fees, 2x referral earnings, and access to exclusive private tournaments.",
+        "read": False,
+        "created_at": now_utc(),
+    })
+    return {"ok": True, "vip_expires_at": iso(new_exp), "perks": {
+        "entry_fee_discount_percent": 10,
+        "referral_multiplier": 2,
+        "exclusive_tournaments": True,
+    }}
+
+
+@api.get("/vip/status")
+async def vip_status(user=Depends(get_user)):
+    fresh = await db.users.find_one({"user_id": user["user_id"]}, {"_id": 0})
+    active = is_vip(fresh)
+    return {
+        "active": active,
+        "expires_at": iso(fresh.get("vip_expires_at")) if active else None,
+        "price": VIP_PRICE,
+        "duration_days": VIP_DAYS,
+        "perks": [
+            "10% discount on tournament entry fees",
+            "2× referral earnings (₹50 per friend instead of ₹25)",
+            "Access to exclusive VIP-only private tournaments",
+            "Priority customer support",
+            "Animated VIP badge on profile & leaderboard",
+        ],
+    }
 
 
 # ============== HEALTH ==============

@@ -14,6 +14,9 @@ import string
 import bcrypt
 import jwt
 import httpx
+import razorpay
+import hmac
+import hashlib
 from pathlib import Path
 from pydantic import BaseModel, Field, EmailStr
 from typing import List, Optional, Any, Dict
@@ -28,6 +31,9 @@ JWT_SECRET = os.environ.get('JWT_SECRET', 'clutcharena-dev-secret-change-me')
 JWT_ALGO = 'HS256'
 JWT_EXPIRE_DAYS = 30
 DEV_OTP = '123456'
+RAZORPAY_KEY_ID = os.environ.get('RAZORPAY_KEY_ID', '')
+RAZORPAY_KEY_SECRET = os.environ.get('RAZORPAY_KEY_SECRET', '')
+rzp_client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET)) if RAZORPAY_KEY_ID else None
 
 client = AsyncIOMotorClient(MONGO_URL)
 db = client[DB_NAME]
@@ -173,6 +179,12 @@ class KycReq(BaseModel):
 class DepositReq(BaseModel):
     amount: float
     method: str = "razorpay"
+
+
+class RazorpayVerifyReq(BaseModel):
+    razorpay_order_id: str
+    razorpay_payment_id: str
+    razorpay_signature: str
 
 
 class WithdrawReq(BaseModel):
@@ -504,9 +516,9 @@ async def get_wallet(user=Depends(get_user)):
 
 @api.post("/wallet/deposit")
 async def deposit(req: DepositReq, user=Depends(get_user)):
+    """Legacy mock deposit kept for backward compatibility / tests. Use /wallet/order for real Razorpay flow."""
     if req.amount <= 0:
         raise HTTPException(status_code=400, detail="Invalid amount")
-    # MOCK Razorpay - in production, create order and verify signature
     tx = {
         "tx_id": new_id("tx"),
         "user_id": user["user_id"],
@@ -515,7 +527,7 @@ async def deposit(req: DepositReq, user=Depends(get_user)):
         "wallet": "deposit",
         "status": "success",
         "method": req.method,
-        "note": "Mock deposit (Razorpay placeholder)",
+        "note": "Mock deposit (legacy)",
         "created_at": now_utc(),
     }
     await db.transactions.insert_one(tx)
@@ -524,6 +536,94 @@ async def deposit(req: DepositReq, user=Depends(get_user)):
         {"$inc": {"wallet.deposit": req.amount}},
     )
     return {"ok": True, "tx_id": tx["tx_id"], "amount": req.amount}
+
+
+@api.post("/wallet/order")
+async def create_deposit_order(req: DepositReq, user=Depends(get_user)):
+    """Create a Razorpay order for wallet deposit. Returns order_id + key_id for checkout."""
+    if not rzp_client:
+        raise HTTPException(status_code=500, detail="Razorpay not configured")
+    if req.amount < 10:
+        raise HTTPException(status_code=400, detail="Minimum deposit is ₹10")
+    amount_paise = int(round(req.amount * 100))
+    receipt = f"clutch_{user['user_id'][-12:]}_{int(now_utc().timestamp())}"[:40]
+    try:
+        order = rzp_client.order.create({
+            "amount": amount_paise,
+            "currency": "INR",
+            "receipt": receipt,
+            "payment_capture": 1,
+            "notes": {"user_id": user["user_id"], "purpose": "wallet_deposit"},
+        })
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Razorpay error: {e}")
+    await db.razorpay_orders.insert_one({
+        "order_id": order["id"],
+        "user_id": user["user_id"],
+        "amount": req.amount,
+        "amount_paise": amount_paise,
+        "status": "created",
+        "created_at": now_utc(),
+    })
+    return {
+        "order_id": order["id"],
+        "key_id": RAZORPAY_KEY_ID,
+        "amount": amount_paise,
+        "currency": "INR",
+        "name": "ClutchArena",
+        "description": f"Wallet deposit ₹{req.amount}",
+        "prefill": {
+            "name": user.get("name", "Player"),
+            "email": user.get("email") or "",
+            "contact": user.get("phone") or "",
+        },
+    }
+
+
+@api.post("/wallet/verify")
+async def verify_deposit(req: RazorpayVerifyReq, user=Depends(get_user)):
+    """Verify Razorpay payment signature and credit user's deposit wallet."""
+    if not rzp_client:
+        raise HTTPException(status_code=500, detail="Razorpay not configured")
+    body = f"{req.razorpay_order_id}|{req.razorpay_payment_id}".encode()
+    expected = hmac.new(RAZORPAY_KEY_SECRET.encode(), body, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected, req.razorpay_signature):
+        await db.razorpay_orders.update_one(
+            {"order_id": req.razorpay_order_id},
+            {"$set": {"status": "signature_failed", "processed_at": now_utc()}},
+        )
+        raise HTTPException(status_code=400, detail="Invalid payment signature")
+    order = await db.razorpay_orders.find_one({"order_id": req.razorpay_order_id, "user_id": user["user_id"]})
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    if order.get("status") == "paid":
+        return {"ok": True, "already_credited": True}
+    amount = float(order["amount"])
+    await db.razorpay_orders.update_one(
+        {"order_id": req.razorpay_order_id},
+        {"$set": {
+            "status": "paid",
+            "payment_id": req.razorpay_payment_id,
+            "processed_at": now_utc(),
+        }},
+    )
+    await db.users.update_one(
+        {"user_id": user["user_id"]},
+        {"$inc": {"wallet.deposit": amount}},
+    )
+    await db.transactions.insert_one({
+        "tx_id": new_id("tx"),
+        "user_id": user["user_id"],
+        "type": "deposit",
+        "amount": amount,
+        "wallet": "deposit",
+        "status": "success",
+        "method": "razorpay",
+        "note": f"Razorpay deposit · {req.razorpay_payment_id}",
+        "ref_id": req.razorpay_order_id,
+        "created_at": now_utc(),
+    })
+    return {"ok": True, "amount": amount}
 
 
 @api.post("/wallet/withdraw")

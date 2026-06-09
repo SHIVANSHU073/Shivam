@@ -63,6 +63,8 @@ export const api = {
   // Wallet
   wallet: () => apiFetch('/wallet'),
   deposit: (amount: number) => apiFetch('/wallet/deposit', { method: 'POST', body: { amount, method: 'razorpay' } }),
+  createOrder: (amount: number) => apiFetch('/wallet/order', { method: 'POST', body: { amount, method: 'razorpay' } }),
+  verifyPayment: (b: any) => apiFetch('/wallet/verify', { method: 'POST', body: b }),
   withdraw: (b: any) => apiFetch('/wallet/withdraw', { method: 'POST', body: b }),
   transactions: () => apiFetch('/wallet/transactions'),
   // Tournaments

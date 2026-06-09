@@ -56,7 +56,18 @@ ClutchArena is a real-money esports tournament Expo mobile app for **BGMI** and 
 - Tournament create/update endpoints
 - Notification broadcast
 
-## Mocked / Limitations
+## Razorpay (LIVE in test mode)
+- Backend env: `RAZORPAY_KEY_ID=rzp_test_SzMvYTrbddV8fA`, `RAZORPAY_KEY_SECRET=...` (set in `/app/backend/.env`)
+- Endpoints:
+  - `POST /api/wallet/order` — creates Razorpay order, returns `order_id` + `key_id` for checkout
+  - `POST /api/wallet/verify` — verifies HMAC-SHA256 signature, credits deposit wallet idempotently
+  - `POST /api/wallet/deposit` — legacy mock, kept for backward compat
+- Frontend: WebView modal loads `checkout.razorpay.com/v1/checkout.js`, posts result back via `ReactNativeWebView.postMessage`. Works in Expo Go (no native module required).
+- Test payment methods:
+  - UPI ID: `success@razorpay`
+  - Card: `4111 1111 1111 1111`, any CVV, any future expiry
+
+
 - 🟡 **Razorpay deposit MOCKED** — credits wallet without real payment. Need Razorpay test keys for real flow.
 - 🟡 **Mobile OTP MOCKED** — returns dev_otp `123456` in response (integrate Twilio/MSG91 for prod)
 - **Google Auth** wired with Emergent backend — works only on deployed builds (not Expo Go preview)

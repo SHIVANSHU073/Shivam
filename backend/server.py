@@ -33,6 +33,7 @@ JWT_EXPIRE_DAYS = 30
 DEV_OTP = '123456'
 RAZORPAY_KEY_ID = os.environ.get('RAZORPAY_KEY_ID', '')
 RAZORPAY_KEY_SECRET = os.environ.get('RAZORPAY_KEY_SECRET', '')
+RAZORPAY_WEBHOOK_SECRET = os.environ.get('RAZORPAY_WEBHOOK_SECRET', '')
 rzp_client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET)) if RAZORPAY_KEY_ID else None
 
 client = AsyncIOMotorClient(MONGO_URL)
@@ -647,32 +648,8 @@ async def verify_deposit(req: RazorpayVerifyReq, user=Depends(get_user)):
         raise HTTPException(status_code=404, detail="Order not found")
     if order.get("status") == "paid":
         return {"ok": True, "already_credited": True}
-    amount = float(order["amount"])
-    await db.razorpay_orders.update_one(
-        {"order_id": req.razorpay_order_id},
-        {"$set": {
-            "status": "paid",
-            "payment_id": req.razorpay_payment_id,
-            "processed_at": now_utc(),
-        }},
-    )
-    await db.users.update_one(
-        {"user_id": user["user_id"]},
-        {"$inc": {"wallet.deposit": amount}},
-    )
-    await db.transactions.insert_one({
-        "tx_id": new_id("tx"),
-        "user_id": user["user_id"],
-        "type": "deposit",
-        "amount": amount,
-        "wallet": "deposit",
-        "status": "success",
-        "method": "razorpay",
-        "note": f"Razorpay deposit · {req.razorpay_payment_id}",
-        "ref_id": req.razorpay_order_id,
-        "created_at": now_utc(),
-    })
-    return {"ok": True, "amount": amount}
+    credited = await credit_paid_order(req.razorpay_order_id, req.razorpay_payment_id, source="client_verify")
+    return {"ok": True, "amount": float(order["amount"]), "credited": credited}
 
 
 @api.post("/wallet/withdraw")
@@ -1664,6 +1641,153 @@ async def vip_status(user=Depends(get_user)):
             "Animated VIP badge on profile & leaderboard",
         ],
     }
+
+
+async def credit_paid_order(order_id: str, payment_id: str, source: str = "webhook") -> bool:
+    """Idempotently mark order as paid and credit deposit wallet. Returns True if newly credited."""
+    order = await db.razorpay_orders.find_one({"order_id": order_id})
+    if not order:
+        return False
+    if order.get("status") == "paid":
+        return False
+    amount = float(order["amount"])
+    await db.razorpay_orders.update_one(
+        {"order_id": order_id, "status": {"$ne": "paid"}},
+        {"$set": {
+            "status": "paid",
+            "payment_id": payment_id,
+            "processed_at": now_utc(),
+            "credited_via": source,
+        }},
+    )
+    # Re-fetch to ensure we won the race
+    updated = await db.razorpay_orders.find_one({"order_id": order_id})
+    if updated.get("credited_via") != source:
+        return False
+    await db.users.update_one(
+        {"user_id": order["user_id"]},
+        {"$inc": {"wallet.deposit": amount}},
+    )
+    await db.transactions.insert_one({
+        "tx_id": new_id("tx"),
+        "user_id": order["user_id"],
+        "type": "deposit",
+        "amount": amount,
+        "wallet": "deposit",
+        "status": "success",
+        "method": "razorpay",
+        "note": f"Razorpay deposit · {payment_id} ({source})",
+        "ref_id": order_id,
+        "created_at": now_utc(),
+    })
+    await db.notifications.insert_one({
+        "notification_id": new_id("ntf"),
+        "user_id": order["user_id"],
+        "title": "Deposit Successful",
+        "message": f"₹{amount} credited to your wallet.",
+        "read": False,
+        "created_at": now_utc(),
+    })
+    return True
+
+
+@app.post("/api/razorpay/webhook")
+async def razorpay_webhook(request: Request):
+    """Receive Razorpay webhook events. Verify HMAC-SHA256 signature against raw body."""
+    if not RAZORPAY_WEBHOOK_SECRET:
+        # If no secret configured, reject for security. Set RAZORPAY_WEBHOOK_SECRET in .env.
+        raise HTTPException(status_code=503, detail="Webhook secret not configured")
+    raw = await request.body()
+    signature = request.headers.get("X-Razorpay-Signature", "")
+    if not signature:
+        raise HTTPException(status_code=400, detail="Missing signature header")
+    expected = hmac.new(RAZORPAY_WEBHOOK_SECRET.encode(), raw, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected, signature):
+        await db.razorpay_webhooks.insert_one({
+            "received_at": now_utc(),
+            "status": "invalid_signature",
+            "headers": dict(request.headers),
+        })
+        raise HTTPException(status_code=400, detail="Invalid webhook signature")
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+    event = payload.get("event", "")
+    event_id = payload.get("id") or new_id("evt")
+
+    # Idempotency: skip duplicate event IDs
+    if await db.razorpay_webhooks.find_one({"event_id": event_id, "status": "processed"}):
+        return {"ok": True, "duplicate": True}
+
+    payment = (payload.get("payload") or {}).get("payment", {}).get("entity", {})
+    refund = (payload.get("payload") or {}).get("refund", {}).get("entity", {})
+    order_id = payment.get("order_id") or refund.get("order_id") or ""
+    payment_id = payment.get("id") or refund.get("payment_id") or ""
+
+    handled = False
+    note = None
+    if event == "payment.captured" and order_id and payment_id:
+        credited = await credit_paid_order(order_id, payment_id, source="webhook")
+        handled = True
+        note = f"credited={credited}"
+    elif event == "payment.failed" and order_id:
+        await db.razorpay_orders.update_one(
+            {"order_id": order_id, "status": {"$ne": "paid"}},
+            {"$set": {"status": "failed", "payment_id": payment_id, "processed_at": now_utc(), "failure_reason": payment.get("error_description")}},
+        )
+        order = await db.razorpay_orders.find_one({"order_id": order_id})
+        if order:
+            await db.notifications.insert_one({
+                "notification_id": new_id("ntf"),
+                "user_id": order["user_id"],
+                "title": "Payment Failed",
+                "message": payment.get("error_description") or "Your deposit could not be processed.",
+                "read": False,
+                "created_at": now_utc(),
+            })
+        handled = True
+    elif event in ("refund.processed", "refund.created") and order_id:
+        order = await db.razorpay_orders.find_one({"order_id": order_id})
+        if order:
+            refund_amount = float(refund.get("amount", 0)) / 100
+            await db.transactions.insert_one({
+                "tx_id": new_id("tx"),
+                "user_id": order["user_id"],
+                "type": "razorpay_refund",
+                "amount": -refund_amount,
+                "wallet": "deposit",
+                "status": "success",
+                "method": "razorpay",
+                "note": f"Razorpay refund · {refund.get('id', '')}",
+                "ref_id": order_id,
+                "created_at": now_utc(),
+            })
+            await db.users.update_one(
+                {"user_id": order["user_id"]},
+                {"$inc": {"wallet.deposit": -refund_amount}},
+            )
+            await db.notifications.insert_one({
+                "notification_id": new_id("ntf"),
+                "user_id": order["user_id"],
+                "title": "Refund Processed",
+                "message": f"₹{refund_amount} has been refunded to your account.",
+                "read": False,
+                "created_at": now_utc(),
+            })
+        handled = True
+
+    await db.razorpay_webhooks.insert_one({
+        "event_id": event_id,
+        "event": event,
+        "order_id": order_id,
+        "payment_id": payment_id,
+        "payload": payload,
+        "received_at": now_utc(),
+        "status": "processed" if handled else "ignored",
+        "note": note,
+    })
+    return {"ok": True, "event": event, "handled": handled}
 
 
 # ============== HEALTH ==============

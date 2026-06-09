@@ -91,8 +91,10 @@ export const api = {
   // Banners
   banners: () => apiFetch('/banners', { auth: false }),
   // Admin
-  adminStats: () => apiFetch('/admin/stats'),
+  adminStats: () => apiFetch('/admin/stats2'),
   adminUsers: (q = '') => apiFetch(`/admin/users${q ? `?q=${encodeURIComponent(q)}` : ''}`),
+  adminUserDetail: (id: string) => apiFetch(`/admin/users/${id}`),
+  adminBanUser: (b: any) => apiFetch('/admin/users/ban', { method: 'POST', body: b }),
   adminWithdrawals: (status = 'pending') => apiFetch(`/admin/withdrawals?status=${status}`),
   adminWithdrawalAction: (b: any) => apiFetch('/admin/withdrawals/action', { method: 'POST', body: b }),
   adminKyc: (status = 'pending') => apiFetch(`/admin/kyc?status=${status}`),
@@ -101,6 +103,11 @@ export const api = {
   adminResultAction: (b: any) => apiFetch('/admin/results/action', { method: 'POST', body: b }),
   adminCreateTournament: (b: any) => apiFetch('/admin/tournaments', { method: 'POST', body: b }),
   adminUpdateTournament: (id: string, b: any) => apiFetch(`/admin/tournaments/${id}`, { method: 'PATCH', body: b }),
+  adminDeleteTournament: (id: string) => apiFetch(`/admin/tournaments/${id}`, { method: 'DELETE' }),
+  adminTournamentRegistrations: (id: string) => apiFetch(`/admin/tournaments/${id}/registrations`),
+  adminRegistrationAction: (b: any) => apiFetch('/admin/registrations/action', { method: 'POST', body: b }),
+  adminAnalytics: (days = 30) => apiFetch(`/admin/analytics?days=${days}`),
+  adminLogs: () => apiFetch('/admin/logs'),
   adminNotify: (b: any) => apiFetch('/admin/notify', { method: 'POST', body: b }),
   teams: () => apiFetch('/teams'),
   teamCreate: (b: any) => apiFetch('/teams', { method: 'POST', body: b }),

@@ -48,13 +48,18 @@ ClutchArena is a real-money esports tournament Expo mobile app for **BGMI** and 
 - Daily / Weekly / Monthly / All-time aggregation by winnings & kills
 - Top 3 podium + ranked list
 
-### Admin Panel (in-app, admin role only)
-- Dashboard stats (users, tournaments, live, pending KYC/withdrawals/deposits)
-- Withdrawal approval / rejection (auto-refund on reject)
-- KYC approval / rejection
-- Match result approval with auto prize credit to winning wallet
-- Tournament create/update endpoints
-- Notification broadcast
+### Admin Panel (in-app, admin role only) — EXPANDED
+- **Dashboard**: total users, banned users, VIP users, tournaments (total/live/upcoming), pending counts (KYC/withdrawals/results), total revenue, deposits, payouts
+- **Tournament Management**: Create with full form (game, mode, type, fee, prize, slots, per-kill, map, start time, registration close, rules, description, banner upload, room creds, publish toggle), Edit, Delete (with auto refund of registered users), Publish/Unpublish, Go LIVE (notifies all registrants)
+- **Participants**: View registered players per tournament with details, Approve/Reject (rejection auto-refunds), CSV Export via native Share
+- **User Management**: Search by name/email/phone, view full user detail with wallet + lifetime stats, Ban/Unban (admin role protected)
+- **Withdrawal Approval**: Approve (pay out) or Reject (auto-refund to winning wallet)
+- **KYC Approval**: View pending KYC requests with PAN/Aadhaar, approve/reject
+- **Match Result Verification**: View submitted results with screenshots, auto-calculate payout from kills + position, manual override, approve & credit
+- **Notifications**: Broadcast to all users or single user, quick presets
+- **Analytics**: Revenue bar chart (last 30d), new users bar chart, top 10 tournaments by registrations
+- **Activity Logs**: All admin actions logged with timestamp + meta (audit trail)
+- **Admin lifetime VIP**: Auto-granted on seed/startup (vip_expires_at = now + 100 years)
 
 ## Razorpay (LIVE in test mode)
 - Backend env: `RAZORPAY_KEY_ID=rzp_test_SzMvYTrbddV8fA`, `RAZORPAY_KEY_SECRET=...` (set in `/app/backend/.env`)

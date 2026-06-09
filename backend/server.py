@@ -99,6 +99,8 @@ async def get_user(authorization: Optional[str] = Header(None)) -> Dict[str, Any
     if uid:
         user = await db.users.find_one({"user_id": uid}, {"_id": 0, "password": 0})
         if user:
+            if user.get("banned"):
+                raise HTTPException(status_code=403, detail="Account banned")
             return user
     # Try Emergent session token
     sess = await db.user_sessions.find_one({"session_token": token}, {"_id": 0})
@@ -110,8 +112,21 @@ async def get_user(authorization: Optional[str] = Header(None)) -> Dict[str, Any
             if exp > now_utc():
                 user = await db.users.find_one({"user_id": sess["user_id"]}, {"_id": 0, "password": 0})
                 if user:
+                    if user.get("banned"):
+                        raise HTTPException(status_code=403, detail="Account banned")
                     return user
     raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+
+async def log_admin(admin_id: str, action: str, target: Optional[str] = None, meta: Optional[Dict] = None):
+    await db.admin_logs.insert_one({
+        "log_id": new_id("log"),
+        "admin_id": admin_id,
+        "action": action,
+        "target": target,
+        "meta": meta or {},
+        "created_at": now_utc(),
+    })
 
 
 async def require_admin(user: Dict[str, Any] = Depends(get_user)) -> Dict[str, Any]:
@@ -203,16 +218,34 @@ class TournamentCreate(BaseModel):
     per_kill: float = 0
     map_name: Optional[str] = None
     start_time: str  # ISO
+    registration_close_time: Optional[str] = None
     rules: Optional[str] = None
-    cover_image: Optional[str] = None
+    description: Optional[str] = None
+    cover_image: Optional[str] = None  # base64
     room_id: Optional[str] = None
     room_password: Optional[str] = None
+    published: bool = True
 
 
 class TournamentUpdate(BaseModel):
+    title: Optional[str] = None
+    game: Optional[str] = None
+    mode: Optional[str] = None
+    type: Optional[str] = None
+    entry_fee: Optional[float] = None
+    prize_pool: Optional[float] = None
+    max_slots: Optional[int] = None
+    per_kill: Optional[float] = None
+    map_name: Optional[str] = None
+    start_time: Optional[str] = None
+    registration_close_time: Optional[str] = None
+    rules: Optional[str] = None
+    description: Optional[str] = None
+    cover_image: Optional[str] = None
     room_id: Optional[str] = None
     room_password: Optional[str] = None
     status: Optional[str] = None
+    published: Optional[bool] = None
     winners: Optional[List[Dict[str, Any]]] = None
 
 
@@ -298,6 +331,22 @@ class NotificationCreate(BaseModel):
     message: str
     target: str = "all"  # all / user_id
     user_id: Optional[str] = None
+
+
+class TournamentDelete(BaseModel):
+    tournament_id: str
+
+
+class UserBanReq(BaseModel):
+    user_id: str
+    banned: bool
+    reason: Optional[str] = None
+
+
+class RegistrationActionReq(BaseModel):
+    registration_id: str
+    approve: bool
+    reason: Optional[str] = None
 
 
 # ============== AUTH ==============
@@ -786,9 +835,16 @@ async def admin_create_tournament(req: TournamentCreate, admin=Depends(require_a
         start_dt = datetime.fromisoformat(req.start_time.replace("Z", "+00:00"))
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid start_time format")
+    reg_close = None
+    if req.registration_close_time:
+        try:
+            reg_close = datetime.fromisoformat(req.registration_close_time.replace("Z", "+00:00"))
+        except Exception:
+            pass
     t = req.dict()
     t["tournament_id"] = new_id("tour")
     t["start_time"] = start_dt
+    t["registration_close_time"] = reg_close
     t["status"] = "upcoming"
     t["winners"] = []
     t["created_at"] = now_utc()
@@ -796,7 +852,9 @@ async def admin_create_tournament(req: TournamentCreate, admin=Depends(require_a
     t["game"] = t["game"].upper()
     t["mode"] = t["mode"].upper()
     await db.tournaments.insert_one(t)
+    await log_admin(admin["user_id"], "tournament.create", t["tournament_id"], {"title": t["title"]})
     t["start_time"] = iso(t["start_time"])
+    t["registration_close_time"] = iso(t["registration_close_time"])
     t["created_at"] = iso(t["created_at"])
     t.pop("_id", None)
     return t
@@ -805,9 +863,20 @@ async def admin_create_tournament(req: TournamentCreate, admin=Depends(require_a
 @api.patch("/admin/tournaments/{tid}")
 async def admin_update_tournament(tid: str, req: TournamentUpdate, admin=Depends(require_admin)):
     updates = {k: v for k, v in req.dict().items() if v is not None}
+    # Parse datetime fields
+    for k in ("start_time", "registration_close_time"):
+        if k in updates and isinstance(updates[k], str):
+            try:
+                updates[k] = datetime.fromisoformat(updates[k].replace("Z", "+00:00"))
+            except Exception:
+                updates.pop(k, None)
+    if "game" in updates:
+        updates["game"] = updates["game"].upper()
+    if "mode" in updates:
+        updates["mode"] = updates["mode"].upper()
     if updates:
         await db.tournaments.update_one({"tournament_id": tid}, {"$set": updates})
-        # If marked live, notify all registered users
+        await log_admin(admin["user_id"], "tournament.update", tid, {"fields": list(updates.keys())})
         if updates.get("status") == "live":
             regs = await db.registrations.find({"tournament_id": tid}, {"_id": 0, "user_id": 1}).to_list(1000)
             t = await db.tournaments.find_one({"tournament_id": tid}, {"_id": 0, "title": 1})
@@ -821,6 +890,241 @@ async def admin_update_tournament(tid: str, req: TournamentUpdate, admin=Depends
                     "created_at": now_utc(),
                 })
     return {"ok": True}
+
+
+@api.delete("/admin/tournaments/{tid}")
+async def admin_delete_tournament(tid: str, admin=Depends(require_admin)):
+    t = await db.tournaments.find_one({"tournament_id": tid})
+    if not t:
+        raise HTTPException(status_code=404, detail="Tournament not found")
+    # Refund any registered users their entry fee
+    regs = await db.registrations.find({"tournament_id": tid}).to_list(1000)
+    for r in regs:
+        fee = float(r.get("fee_paid", 0))
+        if fee > 0:
+            await db.users.update_one(
+                {"user_id": r["user_id"]},
+                {"$inc": {"wallet.deposit": fee}},
+            )
+            await db.transactions.insert_one({
+                "tx_id": new_id("tx"),
+                "user_id": r["user_id"],
+                "type": "tournament_refund",
+                "amount": fee,
+                "wallet": "deposit",
+                "status": "success",
+                "note": f"Refund: tournament cancelled ({t.get('title')})",
+                "ref_id": tid,
+                "created_at": now_utc(),
+            })
+            await db.notifications.insert_one({
+                "notification_id": new_id("ntf"),
+                "user_id": r["user_id"],
+                "title": "Tournament Cancelled",
+                "message": f"{t.get('title')} was cancelled. ₹{fee} refunded.",
+                "read": False,
+                "created_at": now_utc(),
+            })
+    await db.registrations.delete_many({"tournament_id": tid})
+    await db.tournaments.delete_one({"tournament_id": tid})
+    await log_admin(admin["user_id"], "tournament.delete", tid, {"title": t.get("title"), "refunded_users": len(regs)})
+    return {"ok": True, "refunded_users": len(regs)}
+
+
+# ============== ADMIN: REGISTRATIONS ==============
+@api.get("/admin/tournaments/{tid}/registrations")
+async def admin_tournament_registrations(tid: str, admin=Depends(require_admin)):
+    regs = await db.registrations.find({"tournament_id": tid}, {"_id": 0}).sort("registered_at", 1).to_list(1000)
+    out = []
+    for r in regs:
+        u = await db.users.find_one({"user_id": r["user_id"]}, {"_id": 0, "name": 1, "email": 1, "phone": 1, "bgmi_id": 1, "ff_id": 1, "kyc_status": 1})
+        r["registered_at"] = iso(r.get("registered_at"))
+        r["user"] = u
+        out.append(r)
+    return {"registrations": out, "total": len(out)}
+
+
+@api.post("/admin/registrations/action")
+async def admin_registration_action(req: RegistrationActionReq, admin=Depends(require_admin)):
+    reg = await db.registrations.find_one({"registration_id": req.registration_id})
+    if not reg:
+        raise HTTPException(status_code=404, detail="Registration not found")
+    if req.approve:
+        await db.registrations.update_one({"registration_id": req.registration_id}, {"$set": {"approved": True, "reviewed_at": now_utc()}})
+        await log_admin(admin["user_id"], "registration.approve", req.registration_id)
+        return {"ok": True}
+    # Reject: refund + delete
+    fee = float(reg.get("fee_paid", 0))
+    if fee > 0:
+        await db.users.update_one(
+            {"user_id": reg["user_id"]},
+            {"$inc": {"wallet.deposit": fee}},
+        )
+        await db.transactions.insert_one({
+            "tx_id": new_id("tx"),
+            "user_id": reg["user_id"],
+            "type": "registration_refund",
+            "amount": fee,
+            "wallet": "deposit",
+            "status": "success",
+            "note": req.reason or "Registration rejected by admin",
+            "ref_id": reg["tournament_id"],
+            "created_at": now_utc(),
+        })
+    await db.registrations.delete_one({"registration_id": req.registration_id})
+    await db.notifications.insert_one({
+        "notification_id": new_id("ntf"),
+        "user_id": reg["user_id"],
+        "title": "Registration Rejected",
+        "message": req.reason or "Your tournament registration was rejected. Entry fee refunded.",
+        "read": False,
+        "created_at": now_utc(),
+    })
+    await log_admin(admin["user_id"], "registration.reject", req.registration_id, {"reason": req.reason})
+    return {"ok": True, "refunded": fee}
+
+
+# ============== ADMIN: USER MANAGEMENT ==============
+@api.get("/admin/users/{user_id}")
+async def admin_user_detail(user_id: str, admin=Depends(require_admin)):
+    u = await db.users.find_one({"user_id": user_id}, {"_id": 0, "password": 0})
+    if not u:
+        raise HTTPException(status_code=404, detail="User not found")
+    u["created_at"] = iso(u.get("created_at"))
+    u["vip_expires_at"] = iso(u.get("vip_expires_at"))
+    regs_count = await db.registrations.count_documents({"user_id": user_id})
+    wins = await db.results.aggregate([
+        {"$match": {"user_id": user_id, "status": "approved"}},
+        {"$group": {"_id": None, "kills": {"$sum": "$kills"}, "winnings": {"$sum": "$payout"}, "matches": {"$sum": 1}}}
+    ]).to_list(1)
+    deposits = await db.transactions.aggregate([
+        {"$match": {"user_id": user_id, "type": "deposit", "status": "success"}},
+        {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
+    ]).to_list(1)
+    return {
+        "user": u,
+        "stats": {
+            "tournaments_joined": regs_count,
+            "matches_won": wins[0]["matches"] if wins else 0,
+            "total_kills": wins[0]["kills"] if wins else 0,
+            "total_winnings": wins[0]["winnings"] if wins else 0,
+            "total_deposits": deposits[0]["total"] if deposits else 0,
+        },
+    }
+
+
+@api.post("/admin/users/ban")
+async def admin_ban_user(req: UserBanReq, admin=Depends(require_admin)):
+    u = await db.users.find_one({"user_id": req.user_id})
+    if not u:
+        raise HTTPException(status_code=404, detail="User not found")
+    if u.get("role") == "admin":
+        raise HTTPException(status_code=400, detail="Cannot ban admin")
+    await db.users.update_one(
+        {"user_id": req.user_id},
+        {"$set": {"banned": req.banned, "ban_reason": req.reason, "ban_at": now_utc() if req.banned else None}},
+    )
+    await log_admin(admin["user_id"], "user.ban" if req.banned else "user.unban", req.user_id, {"reason": req.reason})
+    return {"ok": True}
+
+
+# ============== ADMIN: ANALYTICS ==============
+@api.get("/admin/analytics")
+async def admin_analytics(admin=Depends(require_admin), days: int = 30):
+    since = now_utc() - timedelta(days=days)
+    # Revenue by day (entry fees + deposits)
+    revenue_pipeline = [
+        {"$match": {"created_at": {"$gte": since}, "status": "success", "type": {"$in": ["deposit", "tournament_entry", "vip_subscription"]}}},
+        {"$group": {
+            "_id": {"date": {"$dateToString": {"format": "%Y-%m-%d", "date": "$created_at"}}, "type": "$type"},
+            "total": {"$sum": {"$abs": "$amount"}},
+        }},
+        {"$sort": {"_id.date": 1}},
+    ]
+    rev_rows = await db.transactions.aggregate(revenue_pipeline).to_list(1000)
+    # Daily user growth
+    user_pipeline = [
+        {"$match": {"created_at": {"$gte": since}}},
+        {"$group": {"_id": {"$dateToString": {"format": "%Y-%m-%d", "date": "$created_at"}}, "count": {"$sum": 1}}},
+        {"$sort": {"_id": 1}},
+    ]
+    user_rows = await db.users.aggregate(user_pipeline).to_list(1000)
+    # Tournament performance (top 10 by registrations)
+    tour_pipeline = [
+        {"$group": {"_id": "$tournament_id", "registered": {"$sum": 1}}},
+        {"$sort": {"registered": -1}},
+        {"$limit": 10},
+    ]
+    tour_rows = await db.registrations.aggregate(tour_pipeline).to_list(10)
+    top_tours = []
+    for r in tour_rows:
+        t = await db.tournaments.find_one({"tournament_id": r["_id"]}, {"_id": 0, "title": 1, "game": 1, "mode": 1, "prize_pool": 1, "max_slots": 1})
+        if t:
+            t["registered"] = r["registered"]
+            top_tours.append(t)
+    return {
+        "revenue_by_day": rev_rows,
+        "users_by_day": user_rows,
+        "top_tournaments": top_tours,
+        "days": days,
+    }
+
+
+@api.get("/admin/logs")
+async def admin_logs(admin=Depends(require_admin), limit: int = 100):
+    docs = await db.admin_logs.find({}, {"_id": 0}).sort("created_at", -1).limit(limit).to_list(limit)
+    for d in docs:
+        d["created_at"] = iso(d.get("created_at"))
+        a = await db.users.find_one({"user_id": d["admin_id"]}, {"_id": 0, "name": 1, "email": 1})
+        d["admin"] = a
+    return {"logs": docs}
+
+
+@api.post("/admin/tournaments-legacy", include_in_schema=False)
+async def admin_create_tournament_alias(req: TournamentCreate, admin=Depends(require_admin)):
+    return await admin_create_tournament(req, admin)
+
+
+# Updated stats endpoint with revenue + active matches
+@api.get("/admin/stats2")
+async def admin_stats2(admin=Depends(require_admin)):
+    total_users = await db.users.count_documents({})
+    active_users = await db.users.count_documents({"banned": {"$ne": True}})
+    banned_users = await db.users.count_documents({"banned": True})
+    total_tournaments = await db.tournaments.count_documents({})
+    live_tournaments = await db.tournaments.count_documents({"status": "live"})
+    upcoming_tournaments = await db.tournaments.count_documents({"status": "upcoming"})
+    pending_kyc = await db.kyc.count_documents({"status": "pending"})
+    pending_withdrawals = await db.withdrawals.count_documents({"status": "pending"})
+    pending_results = await db.results.count_documents({"status": "pending"})
+    vip_users = await db.users.count_documents({"vip_active": True})
+    rev = await db.transactions.aggregate([
+        {"$match": {"status": "success", "type": {"$in": ["deposit", "tournament_entry", "vip_subscription"]}}},
+        {"$group": {"_id": None, "total": {"$sum": {"$abs": "$amount"}}}},
+    ]).to_list(1)
+    deposits = await db.transactions.aggregate([
+        {"$match": {"type": "deposit", "status": "success"}},
+        {"$group": {"_id": None, "total": {"$sum": "$amount"}}},
+    ]).to_list(1)
+    payouts = await db.transactions.aggregate([
+        {"$match": {"type": "tournament_prize", "status": "success"}},
+        {"$group": {"_id": None, "total": {"$sum": "$amount"}}},
+    ]).to_list(1)
+    return {
+        "total_users": total_users,
+        "active_users": active_users,
+        "banned_users": banned_users,
+        "vip_users": vip_users,
+        "total_tournaments": total_tournaments,
+        "live_tournaments": live_tournaments,
+        "upcoming_tournaments": upcoming_tournaments,
+        "pending_kyc": pending_kyc,
+        "pending_withdrawals": pending_withdrawals,
+        "pending_results": pending_results,
+        "total_revenue": rev[0]["total"] if rev else 0,
+        "deposits_total": deposits[0]["total"] if deposits else 0,
+        "payouts_total": payouts[0]["total"] if payouts else 0,
+    }
 
 
 @api.get("/my/tournaments")
@@ -1382,16 +1686,35 @@ async def startup():
     await db.transactions.create_index("user_id")
     await db.notifications.create_index("user_id")
 
-    # Seed admin
+    # Seed admin with lifetime VIP
     admin = await db.users.find_one({"email": "admin@clutcharena.com"})
     if not admin:
-        await create_user(
+        a = await create_user(
             name="Admin",
             email="admin@clutcharena.com",
             password_hash=hash_pw("Admin@123"),
             role="admin",
         )
-        logger.info("Seeded admin user")
+        await db.users.update_one(
+            {"user_id": a["user_id"]},
+            {"$set": {
+                "vip_active": True,
+                "vip_expires_at": now_utc() + timedelta(days=36500),  # 100 years
+            }},
+        )
+        logger.info("Seeded admin user with lifetime VIP")
+    else:
+        # Ensure existing admin has lifetime VIP
+        exp = admin.get("vip_expires_at")
+        if not admin.get("vip_active") or not exp or (exp.replace(tzinfo=timezone.utc) if exp.tzinfo is None else exp) < now_utc() + timedelta(days=365):
+            await db.users.update_one(
+                {"user_id": admin["user_id"]},
+                {"$set": {
+                    "vip_active": True,
+                    "vip_expires_at": now_utc() + timedelta(days=36500),
+                }},
+            )
+            logger.info("Granted lifetime VIP to existing admin")
 
     # Seed test player
     player = await db.users.find_one({"email": "player@clutcharena.com"})
